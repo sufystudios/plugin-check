@@ -1,0 +1,16 @@
+# plugin-check on itself: the script runs, and with nothing to test exits 2.
+name: Self test
+on: [push, pull_request]
+jobs:
+  run:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          python plugin-check.py --version
+          set +e; python plugin-check.py . ; code=$?; set -e
+          test "$code" = 2

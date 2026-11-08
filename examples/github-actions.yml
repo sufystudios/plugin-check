@@ -1,0 +1,21 @@
+# Build a plugin and check every format it makes, on macOS and Windows.
+name: Plugins
+on: [push]
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel
+      - uses: actions/checkout@v4
+        with: { repository: sufystudios/plugin-check, path: plugin-check }
+      - name: Check the plugins
+        run: python plugin-check/plugin-check.py build/bin --no-gui --only bundle,pluginval,clap-validator
