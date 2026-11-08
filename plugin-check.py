@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 PASS, WARN, FAIL, SKIP = "passed", "warning", "failed", "skipped"
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
@@ -75,10 +75,10 @@ def log(message, verbose):
         print(message, file=sys.stderr)
 
 
-def download(url, verbose):
+def download(url, verbose, accept=None):
     for attempt in range(3):
         try:
-            return _download(url, verbose)
+            return _download(url, verbose, accept)
         except (urllib.error.HTTPError, RuntimeError) as e:
             code = getattr(e, "code", None)
             transient = (code is not None and code >= 500) or " 50" in str(e)
@@ -88,7 +88,7 @@ def download(url, verbose):
             time.sleep(2 * (attempt + 1))
 
 
-def _download(url, verbose):
+def _download(url, verbose, accept=None):
     """Python's own HTTPS, or curl when Python has no certificates to check with (the
     python.org installer on macOS, until its Install Certificates step is run)."""
     log(f"downloading {url}", verbose)
@@ -97,6 +97,8 @@ def _download(url, verbose):
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token and url.startswith("https://api.github.com/"):
         headers["Authorization"] = f"Bearer {token}"
+    if accept:
+        headers["Accept"] = accept
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
@@ -109,7 +111,10 @@ def _download(url, verbose):
         raise RuntimeError("Python can't verify HTTPS certificates here and curl isn't installed. "
                            "On macOS, run 'Install Certificates.command' in your Python folder.")
     log("Python has no CA certificates; downloading with curl", verbose)
-    p = subprocess.run([curl, "-fsSL", "-A", f"plugin-check/{VERSION}", url], stdout=subprocess.PIPE,
+    extra = ["-H", f"Accept: {accept}"] if accept else []
+    if token and url.startswith("https://api.github.com/"):
+        extra += ["-H", f"Authorization: Bearer {token}"]
+    p = subprocess.run([curl, "-fsSL", "-A", f"plugin-check/{VERSION}"] + extra + [url], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, timeout=300)
     if p.returncode != 0:
         raise RuntimeError(f"curl couldn't download {url}: {p.stderr.decode(errors='replace').strip()}")
@@ -130,6 +135,20 @@ def redirected_url(url, verbose):
     p = subprocess.run([curl, "-sIL", "-o", os.devnull, "-w", "%{url_effective}", url],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     return p.stdout.decode().strip()
+
+
+def download_asset(asset, verbose):
+    """A release file: from its public link, or, when GitHub's download route fails
+    (it has returned 504s to some networks while the API kept working), from the API's
+    asset route, as `gh release download` does."""
+    try:
+        return download(asset["browser_download_url"], verbose)
+    except Exception as e:
+        api = asset.get("url")
+        if not api:
+            raise
+        log(f"{asset['name']}: {e}; trying GitHub's API instead", verbose)
+        return download(api, verbose, accept="application/octet-stream")
 
 
 def latest_assets(repo, verbose):
@@ -224,9 +243,12 @@ class Tools:
             root = os.path.join(self.dir, "pluginval")
             path = find_file(root, {exe}) if os.path.isdir(root) else None
             if not path and self.allow_download:
-                asset = {"Darwin": "pluginval_macOS.zip", "Windows": "pluginval_Windows.zip"}.get(SYSTEM, "pluginval_Linux.zip")
-                url = f"https://github.com/Tracktion/pluginval/releases/latest/download/{asset}"
-                unpack(download(url, self.verbose), asset, root)
+                name = {"Darwin": "pluginval_macOS.zip", "Windows": "pluginval_Windows.zip"}.get(SYSTEM, "pluginval_Linux.zip")
+                _, assets = latest_assets("Tracktion/pluginval", self.verbose)
+                asset = next((a for a in assets if a["name"] == name), None)
+                if not asset:
+                    raise RuntimeError(f"pluginval's latest release has no {name}")
+                unpack(download_asset(asset, self.verbose), name, root)
                 path = find_file(root, {exe})
         return path
 
@@ -244,7 +266,7 @@ class Tools:
                 want = {"Darwin": "macos-universal", "Windows": "windows"}.get(SYSTEM, "ubuntu")
                 asset = next((a for a in assets if want in a["name"]), None)
                 if asset:
-                    unpack(download(asset["browser_download_url"], self.verbose), asset["name"], root)
+                    unpack(download_asset(asset, self.verbose), asset["name"], root)
                     # Its zip holds a tarball (to keep the executable bit): unpack that too.
                     inner = find_archive(root)
                     while inner and not find_file(root, {exe}):
