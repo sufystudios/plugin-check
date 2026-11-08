@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 PASS, WARN, FAIL, SKIP = "passed", "warning", "failed", "skipped"
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
@@ -200,11 +200,24 @@ class Tools:
         self.allow_download = allow_download
         self.verbose = verbose
         self._found = {}
+        self._errors = {}
+
+    def _get(self, name, fetch):
+        """A tool's path; a download that failed is reported again for each plugin, not skipped."""
+        if name in self._errors:
+            raise RuntimeError(self._errors[name])
+        if name not in self._found:
+            try:
+                self._found[name] = fetch()
+            except Exception as e:
+                self._errors[name] = f"couldn't get {name}: {type(e).__name__}: {e}"
+                raise RuntimeError(self._errors[name]) from e
+        return self._found[name]
 
     def pluginval(self):
-        if "pluginval" in self._found:
-            return self._found["pluginval"]
-        self._found["pluginval"] = None  # if fetching it fails, don't try again for the next plugin
+        return self._get("pluginval", self._fetch_pluginval)
+
+    def _fetch_pluginval(self):
         exe = "pluginval.exe" if SYSTEM == "Windows" else "pluginval"
         path = shutil.which("pluginval")
         if not path:
@@ -215,13 +228,12 @@ class Tools:
                 url = f"https://github.com/Tracktion/pluginval/releases/latest/download/{asset}"
                 unpack(download(url, self.verbose), asset, root)
                 path = find_file(root, {exe})
-        self._found["pluginval"] = path
         return path
 
     def clap_validator(self):
-        if "clap-validator" in self._found:
-            return self._found["clap-validator"]
-        self._found["clap-validator"] = None
+        return self._get("clap-validator", self._fetch_clap_validator)
+
+    def _fetch_clap_validator(self):
         exe = "clap-validator.exe" if SYSTEM == "Windows" else "clap-validator"
         path = shutil.which("clap-validator")
         if not path:
@@ -241,7 +253,6 @@ class Tools:
                         os.remove(inner)
                         inner = find_archive(root)
                     path = find_file(root, {exe})
-        self._found["clap-validator"] = path
         return path
 
 
@@ -505,7 +516,8 @@ def guarded(id, title, step):
         return result if isinstance(result, list) else [result]
     except Exception as e:
         return [Check(id, title, FAIL, f"{type(e).__name__}: {e}",
-                      "Rerun with --verbose to see what plugin-check was doing.")]
+                      "GitHub may be having trouble; try again shortly." if "HTTP Error 5" in str(e) or " 50" in str(e)
+                      else "Rerun with --verbose to see what plugin-check was doing.")]
 
 
 def check_plugin(path, fmt, tools, args):
