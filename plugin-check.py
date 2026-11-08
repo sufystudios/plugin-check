@@ -9,6 +9,10 @@ and get one report.
     all                bundle checks: the binary is there, its architectures, code
                        signing, notarization and quarantine (macOS)
 
+A Windows build on a Mac or Linux (a .vst3 holding a Windows binary, or a Windows
+.clap) is tested with the Windows validators under CrossOver or Wine, in a bottle of
+its own. That's a rough check: Wine isn't Windows.
+
 The validators are downloaded the first time they're needed, into a cache folder,
 from their official GitHub releases. Python 3.8+, standard library only; runs on
 macOS, Windows and Linux.
@@ -35,7 +39,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-VERSION = "0.1.5"
+VERSION = "0.2.0"
 
 PASS, WARN, FAIL, SKIP = "passed", "warning", "failed", "skipped"
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
@@ -233,17 +237,17 @@ class Tools:
                 raise RuntimeError(self._errors[name]) from e
         return self._found[name]
 
-    def pluginval(self):
-        return self._get("pluginval", self._fetch_pluginval)
+    def pluginval(self, target=SYSTEM):
+        return self._get(f"pluginval-{target}", lambda: self._fetch_pluginval(target))
 
-    def _fetch_pluginval(self):
-        exe = "pluginval.exe" if SYSTEM == "Windows" else "pluginval"
-        path = shutil.which("pluginval")
+    def _fetch_pluginval(self, target):
+        exe = "pluginval.exe" if target == "Windows" else "pluginval"
+        path = shutil.which("pluginval") if target == SYSTEM else None
         if not path:
-            root = os.path.join(self.dir, "pluginval")
+            root = os.path.join(self.dir, "pluginval" if target == SYSTEM else f"pluginval-{target.lower()}")
             path = find_file(root, {exe}) if os.path.isdir(root) else None
             if not path and self.allow_download:
-                name = {"Darwin": "pluginval_macOS.zip", "Windows": "pluginval_Windows.zip"}.get(SYSTEM, "pluginval_Linux.zip")
+                name = {"Darwin": "pluginval_macOS.zip", "Windows": "pluginval_Windows.zip"}.get(target, "pluginval_Linux.zip")
                 _, assets = latest_assets("Tracktion/pluginval", self.verbose)
                 asset = next((a for a in assets if a["name"] == name), None)
                 if not asset:
@@ -252,18 +256,18 @@ class Tools:
                 path = find_file(root, {exe})
         return path
 
-    def clap_validator(self):
-        return self._get("clap-validator", self._fetch_clap_validator)
+    def clap_validator(self, target=SYSTEM):
+        return self._get(f"clap-validator-{target}", lambda: self._fetch_clap_validator(target))
 
-    def _fetch_clap_validator(self):
-        exe = "clap-validator.exe" if SYSTEM == "Windows" else "clap-validator"
-        path = shutil.which("clap-validator")
+    def _fetch_clap_validator(self, target):
+        exe = "clap-validator.exe" if target == "Windows" else "clap-validator"
+        path = shutil.which("clap-validator") if target == SYSTEM else None
         if not path:
-            root = os.path.join(self.dir, "clap-validator")
+            root = os.path.join(self.dir, "clap-validator" if target == SYSTEM else f"clap-validator-{target.lower()}")
             path = find_file(root, {exe}) if os.path.isdir(root) else None
             if not path and self.allow_download:
                 _, assets = latest_assets("free-audio/clap-validator", self.verbose)
-                want = {"Darwin": "macos-universal", "Windows": "windows"}.get(SYSTEM, "ubuntu")
+                want = {"Darwin": "macos-universal", "Windows": "windows"}.get(target, "ubuntu")
                 asset = next((a for a in assets if want in a["name"]), None)
                 if asset:
                     unpack(download_asset(asset, self.verbose), asset["name"], root)
@@ -278,11 +282,11 @@ class Tools:
         return path
 
 
-def run(cmd, timeout, verbose):
+def run(cmd, timeout, verbose, env=None):
     log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd), verbose)
     started = time.time()
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, env=env)
         out = p.stdout.decode("utf-8", errors="replace")
         return p.returncode, out, time.time() - started
     except subprocess.TimeoutExpired as e:
@@ -295,6 +299,90 @@ def run(cmd, timeout, verbose):
 def tail(text, lines=12):
     rows = [r for r in text.strip().splitlines() if r.strip()]
     return "\n".join(rows[-lines:])
+
+
+# MARK: - Windows plugins under CrossOver or Wine
+
+
+def is_windows_binary(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def pe_machine(path):
+    """The CPU a Windows binary is for: x64, x86 or arm64."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(4096)
+        offset = int.from_bytes(data[0x3C:0x40], "little")
+        machine = int.from_bytes(data[offset + 4:offset + 6], "little")
+        return {0x8664: "x64", 0x14C: "x86", 0xAA64: "arm64"}.get(machine, hex(machine))
+    except (OSError, ValueError):
+        return "?"
+
+
+def windows_path(path):
+    """A Mac or Linux path as Wine's Windows programs see it (its Z: drive)."""
+    return "Z:" + os.path.abspath(path).replace("/", "\\")
+
+
+def find_crossover(explicit=None):
+    """CrossOver's bin folder (with wine and cxbottle), if it's installed."""
+    candidates = [explicit, os.environ.get("CROSSOVER_APP")]
+    if SYSTEM == "Darwin":
+        import glob
+        for root in ["/Applications", os.path.expanduser("~/Applications")] + glob.glob("/Volumes/*/Applications"):
+            candidates += sorted(glob.glob(os.path.join(root, "CrossOver*.app")))
+    for app in candidates:
+        if app:
+            bin_dir = os.path.join(app, "Contents", "SharedSupport", "CrossOver", "bin")
+            if os.path.isfile(os.path.join(bin_dir, "wine")):
+                return bin_dir
+    return None
+
+
+class Wine:
+    """Runs Windows programs: in a CrossOver bottle, or with plain Wine in a prefix of its own."""
+
+    def __init__(self, args):
+        self.name = None
+        self.prefix = []
+        self.env = None
+        self.args = args
+        self.ready = False
+        bin_dir = find_crossover(args.crossover)
+        if bin_dir:
+            self.name = "CrossOver"
+            self.bin = bin_dir
+            self.prefix = [os.path.join(bin_dir, "wine"), "--bottle", args.bottle]
+        elif shutil.which("wine"):
+            self.name = "Wine"
+            self.prefix = [shutil.which("wine")]
+            self.env = dict(os.environ, WINEPREFIX=os.path.join(cache_dir(), "wineprefix"), WINEDEBUG="-all")
+
+    def prepare(self):
+        """Creates the bottle (or prefix) the first time."""
+        if self.ready or not self.name:
+            return
+        if self.name == "CrossOver":
+            bottle = os.path.expanduser(f"~/Library/Application Support/CrossOver/Bottles/{self.args.bottle}")
+            if not os.path.isdir(bottle):
+                log(f"creating the CrossOver bottle '{self.args.bottle}' (Windows 10 64-bit)", self.args.verbose)
+                code, out, _ = run([os.path.join(self.bin, "cxbottle"), "--bottle", self.args.bottle, "--create",
+                                    "--template", "win10_64", "--description", "plugin-check"], 600, self.args.verbose)
+                if code != 0:
+                    raise RuntimeError("couldn't create the CrossOver bottle: " + tail(out, 4))
+        else:
+            os.makedirs(self.env["WINEPREFIX"], exist_ok=True)
+            run(self.prefix + ["wineboot", "-u"], 600, self.args.verbose, env=self.env)
+        self.ready = True
+
+    def command(self, exe, arguments):
+        self.prepare()
+        return self.prefix + [exe] + arguments
 
 
 # MARK: - Bundle checks
@@ -338,6 +426,13 @@ def bundle_checks(path, fmt, verbose):
                             "A VST3 or AU bundle keeps it in Contents/MacOS (macOS) or Contents/<arch>-win (Windows)."))
         return checks, None
     checks.append(Check("bundle", "Has its binary", PASS, os.path.relpath(binary, os.path.dirname(path))))
+
+    if is_windows_binary(binary):
+        machine = pe_machine(binary)
+        checks.append(Check("architectures", "Windows 64-bit (x64)", PASS if machine == "x64" else WARN,
+                            f"A Windows {machine} binary.",
+                            "" if machine == "x64" else "Most Windows DAWs are x64; build that too."))
+        return checks, binary
 
     if SYSTEM == "Darwin":
         code, out, _ = run(["lipo", "-archs", binary], 30, verbose)
@@ -384,15 +479,19 @@ def bundle_checks(path, fmt, verbose):
 # MARK: - Validators
 
 
-def check_pluginval(path, fmt, tools, args):
-    exe = tools.pluginval()
+def check_pluginval(path, fmt, tools, args, wine=None):
+    target = "Windows" if wine else SYSTEM
+    where = f", in {wine.name}" if wine else ""
+    exe = tools.pluginval(target)
     if not exe:
         return Check("pluginval", f"pluginval ({fmt})", SKIP, "pluginval isn't available (and downloading is off).")
-    cmd = [exe, "--strictness-level", str(args.strictness), "--validate-in-process", "--timeout-ms", "120000"]
+    options = ["--strictness-level", str(args.strictness), "--validate-in-process", "--timeout-ms", "120000"]
     if args.no_gui:
-        cmd.append("--skip-gui-tests")
-    cmd += ["--validate", path]
-    code, out, seconds = run(cmd, args.timeout, args.verbose)
+        options.append("--skip-gui-tests")
+    options += ["--validate", windows_path(path) if wine else path]
+    cmd = wine.command(exe, options) if wine else [exe] + options
+    code, out, seconds = run(cmd, args.timeout, args.verbose, env=wine.env if wine else None)
+    fmt = fmt + where
     if code is None:
         return Check("pluginval", f"pluginval ({fmt}), strictness {args.strictness}", FAIL,
                      f"Timed out after {args.timeout} s.\n" + tail(out),
@@ -412,11 +511,13 @@ def check_pluginval(path, fmt, tools, args):
                  "Rerun with --verbose for pluginval's full log.")
 
 
-def check_clap_validator(path, tools, args):
-    exe = tools.clap_validator()
+def check_clap_validator(path, tools, args, wine=None):
+    exe = tools.clap_validator("Windows" if wine else SYSTEM)
     if not exe:
         return Check("clap-validator", "clap-validator (CLAP)", SKIP, "clap-validator isn't available (and downloading is off).")
-    code, out, seconds = run([exe, "validate", "--json", path], args.timeout, args.verbose)
+    options = ["validate", "--json", windows_path(path) if wine else path]
+    cmd = wine.command(exe, options) if wine else [exe] + options
+    code, out, seconds = run(cmd, args.timeout, args.verbose, env=wine.env if wine else None)
     if code is None:
         return Check("clap-validator", "clap-validator (CLAP)", FAIL, f"Timed out after {args.timeout} s.\n" + tail(out))
     failed, warned, skipped, total = [], [], 0, 0
@@ -444,14 +545,17 @@ def check_clap_validator(path, tools, args):
         return Check("clap-validator", "clap-validator (CLAP)", FAIL if code not in (0, None) else WARN,
                      "Couldn't read clap-validator's results.\n" + tail(out),
                      "Run it yourself with --verbose; its output format may have changed.")
+    title = "clap-validator (CLAP" + (f", in {wine.name})" if wine else ")")
     if failed or (code not in (0, None) and not total):
-        return Check("clap-validator", "clap-validator (CLAP)", FAIL,
+        return Check("clap-validator", title, FAIL,
                      "\n".join(failed[:12]) if failed else tail(out),
                      "Rerun clap-validator with --only-failed for the full reasons.")
     status = WARN if warned else PASS
+    if wine:
+        warned.append(f"Run in {wine.name}, not Windows: a rough check.")
     detail = (f"{total} tests ({total - skipped - len(warned)} passed, {skipped} skipped), none failed, in {seconds:.0f} s."
               + ("\n" + "\n".join(warned[:8]) if warned else ""))
-    return Check("clap-validator", "clap-validator (CLAP)", status, detail)
+    return Check("clap-validator", title, status, detail)
 
 
 def au_codes(path):
@@ -542,10 +646,26 @@ def guarded(id, title, step):
                       else "Rerun with --verbose to see what plugin-check was doing.")]
 
 
-def check_plugin(path, fmt, tools, args):
+def check_plugin(path, fmt, tools, args, wine):
     checks = []
     if "bundle" in args.only:
         checks += guarded("bundle", "Bundle checks", lambda: bundle_checks(path, fmt, args.verbose)[0])
+    binary = plugin_binary(path, fmt)
+    foreign = SYSTEM != "Windows" and binary is not None and is_windows_binary(binary)
+    if foreign:
+        # A Windows build here: its validators run under CrossOver or Wine.
+        if not wine.name:
+            checks.append(Check("wine", "Windows validators", SKIP,
+                                "This is a Windows build, and neither CrossOver nor Wine is installed.",
+                                "Install CrossOver (codeweavers.com) or Wine, or test it on Windows."))
+            return checks
+        if fmt == "VST3" and "pluginval" in args.only:
+            checks += guarded("pluginval", f"pluginval (VST3, in {wine.name})",
+                              lambda: check_pluginval(path, fmt, tools, args, wine))
+        if fmt == "CLAP" and "clap-validator" in args.only:
+            checks += guarded("clap-validator", f"clap-validator (CLAP, in {wine.name})",
+                              lambda: check_clap_validator(path, tools, args, wine))
+        return checks
     if fmt in ("VST3", "AU") and "pluginval" in args.only:
         checks += guarded("pluginval", f"pluginval ({fmt})", lambda: check_pluginval(path, fmt, tools, args))
     if fmt == "CLAP" and "clap-validator" in args.only:
@@ -571,6 +691,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=600, help="seconds per validator run (default 600)")
     parser.add_argument("--tools-dir", default=cache_dir(), help="where downloaded validators are kept")
     parser.add_argument("--no-download", action="store_true", help="use validators on PATH or already cached only")
+    parser.add_argument("--bottle", default="plugin-check",
+                        help="CrossOver bottle for Windows builds (created if missing; default plugin-check)")
+    parser.add_argument("--crossover", metavar="APP", help="path to CrossOver.app, if it isn't found by itself")
     parser.add_argument("--verbose", action="store_true", help="print progress and commands to stderr")
     parser.add_argument("--version", action="version", version=f"plugin-check {VERSION}")
     args = parser.parse_args()
@@ -590,11 +713,12 @@ def main():
         return 2
 
     tools = Tools(args.tools_dir, not args.no_download, args.verbose)
+    wine = Wine(args)
     results = []
     for path, fmt in plugins:
         log(f"checking {path}", args.verbose)
         try:
-            checks = check_plugin(path, fmt, tools, args)
+            checks = check_plugin(path, fmt, tools, args, wine)
         except Exception as e:  # a broken download, say: report it rather than crash
             checks = [Check("plugin-check", "plugin-check", FAIL, f"{type(e).__name__}: {e}")]
         results.append({"path": path, "format": fmt, "checks": checks})

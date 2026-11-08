@@ -66,6 +66,8 @@ plugin-check build/bin --json                 # for scripts and coding agents
 | `--timeout <s>` | Seconds per validator run (default 600). |
 | `--no-download` | Use validators on PATH or already cached; download nothing. |
 | `--tools-dir <dir>` | Where downloaded validators are kept. |
+| `--bottle <name>` | The CrossOver bottle for Windows builds (default `plugin-check`, created if missing). |
+| `--crossover <app>` | Where CrossOver is, if it isn't found by itself. |
 | `--verbose` | Print progress and every command run to stderr. |
 
 **Exit codes:** `0` every check passed (there may be warnings), `1` at least one
@@ -82,19 +84,29 @@ macOS and Windows runners, then run `plugin-check build/bin --no-gui`. Pass
 `GITHUB_TOKEN` in its environment: GitHub's API allows few anonymous calls from CI
 machines (plugin-check falls back to the release pages if it's refused).
 
-## Windows plugins on a Mac or Linux (Wine)
+## Windows plugins on a Mac or Linux (CrossOver or Wine)
 
-You can run the Windows validators under [Wine](https://www.winehq.org) to look at a
-Windows build without a PC, but treat it as a rough check: Wine isn't Windows, so a
-pass is encouraging and a failure may be Wine's. OpenGL windows, audio timing and
-drivers (rtpMIDI, ASIO) are where it differs most. For a real answer, run
-plugin-check on a Windows CI runner (see above).
+Give plugin-check a Windows build on a Mac or Linux (a `.vst3` with a Windows binary
+inside, or a Windows `.clap`) and it runs the **Windows** pluginval and
+clap-validator under [CrossOver](https://www.codeweavers.com/crossover) if it's
+installed, or [Wine](https://www.winehq.org), and says so in the report:
 
-```sh
-# macOS (Apple Silicon runs it through Rosetta 2): brew install --cask --no-quarantine wine-stable
-wine pluginval.exe --skip-gui-tests --strictness-level 5 --validate MySynth.vst3
-wine clap-validator.exe validate MySynth.clap
 ```
+$ plugin-check build-windows/
+VST3  build-windows/MySynth.vst3
+  ✓ Has its binary
+  ✓ Windows 64-bit (x64)
+  ✓ pluginval (VST3, in CrossOver), strictness 5
+```
+
+- CrossOver: a bottle named `plugin-check` (Windows 10 64-bit) is created the first
+  time; pick another with `--bottle`. CrossOver is found in `/Applications`,
+  `~/Applications` or `/Volumes/*/Applications`, or pass `--crossover <path to .app>`.
+- Wine: a prefix of its own in plugin-check's cache folder.
+
+Treat it as a rough check: Wine isn't Windows, so a pass is encouraging and a failure
+may be Wine's. OpenGL windows, audio timing and drivers (rtpMIDI, ASIO) are where it
+differs most. For a real answer, run plugin-check on a Windows CI runner.
 
 ## Licence
 
