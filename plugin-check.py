@@ -35,10 +35,11 @@ import urllib.error
 import urllib.request
 import zipfile
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 PASS, WARN, FAIL, SKIP = "passed", "warning", "failed", "skipped"
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
+ASCII_SYMBOL = {PASS: "+", WARN: "!", FAIL: "x", SKIP: "-"}
 
 FORMATS = {".vst3": "VST3", ".clap": "CLAP", ".component": "AU"}
 
@@ -75,10 +76,28 @@ def log(message, verbose):
 
 
 def download(url, verbose):
+    for attempt in range(3):
+        try:
+            return _download(url, verbose)
+        except (urllib.error.HTTPError, RuntimeError) as e:
+            code = getattr(e, "code", None)
+            transient = (code is not None and code >= 500) or " 50" in str(e)
+            if not transient or attempt == 2:
+                raise
+            log(f"{url}: {e}; trying again", verbose)
+            time.sleep(2 * (attempt + 1))
+
+
+def _download(url, verbose):
     """Python's own HTTPS, or curl when Python has no certificates to check with (the
     python.org installer on macOS, until its Install Certificates step is run)."""
     log(f"downloading {url}", verbose)
-    request = urllib.request.Request(url, headers={"User-Agent": f"plugin-check/{VERSION}"})
+    headers = {"User-Agent": f"plugin-check/{VERSION}"}
+    # GitHub's API allows few anonymous calls from shared CI machines: use a token if there is one.
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and url.startswith("https://api.github.com/"):
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
             return response.read()
@@ -97,10 +116,40 @@ def download(url, verbose):
     return p.stdout
 
 
+def redirected_url(url, verbose):
+    """Where a URL redirects to, with Python's HTTPS or curl."""
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": f"plugin-check/{VERSION}"}, method="HEAD")
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.geturl()
+    except urllib.error.URLError as e:
+        log(f"couldn't follow {url} with Python ({e}); trying curl", verbose)
+    curl = shutil.which("curl")
+    if not curl:
+        return ""
+    p = subprocess.run([curl, "-sIL", "-o", os.devnull, "-w", "%{url_effective}", url],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    return p.stdout.decode().strip()
+
+
 def latest_assets(repo, verbose):
-    data = download(f"https://api.github.com/repos/{repo}/releases/latest", verbose)
-    release = json.loads(data)
-    return release.get("tag_name", ""), release.get("assets", [])
+    """The latest release's tag and assets: from GitHub's API, or, when that's rate
+    limited, from the release page itself."""
+    try:
+        release = json.loads(download(f"https://api.github.com/repos/{repo}/releases/latest", verbose))
+        return release.get("tag_name", ""), release.get("assets", [])
+    except urllib.error.HTTPError as e:
+        if e.code not in (403, 429):
+            raise
+        log(f"GitHub's API said {e.code}; reading the release page instead", verbose)
+    # /releases/latest redirects to /releases/tag/<tag>; the assets list loads from expanded_assets.
+    final = redirected_url(f"https://github.com/{repo}/releases/latest", verbose)
+    tag = final.rsplit("/", 1)[-1] if "/tag/" in final else ""
+    if not tag:
+        raise RuntimeError(f"couldn't find {repo}'s latest release")
+    page = download(f"https://github.com/{repo}/releases/expanded_assets/{tag}", verbose).decode("utf-8", "replace")
+    links = sorted(set(re.findall(rf'href="(/{re.escape(repo)}/releases/download/[^"]+)"', page)))
+    return tag, [{"name": l.rsplit("/", 1)[-1], "browser_download_url": "https://github.com" + l} for l in links]
 
 
 def unpack(data, name, dest):
@@ -491,6 +540,14 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="print progress and commands to stderr")
     parser.add_argument("--version", action="version", version=f"plugin-check {VERSION}")
     args = parser.parse_args()
+    # A console that can't show ✓ and ✗ (Windows' cp1252, say) gets plain markers.
+    global SYMBOL
+    try:
+        "✓✗→".encode(sys.stdout.encoding or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        SYMBOL = ASCII_SYMBOL
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
     args.only = {s.strip() for s in args.only.split(",") if s.strip()}
 
     plugins = plugin_paths(args.paths)

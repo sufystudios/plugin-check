@@ -78,7 +78,23 @@ On macOS, an AU must be registered before `auval` can find it: put it in
 ## In CI
 
 See [examples/github-actions.yml](examples/github-actions.yml): build your plugin on
-macOS and Windows runners, then run `plugin-check build/bin --no-gui`.
+macOS and Windows runners, then run `plugin-check build/bin --no-gui`. Pass
+`GITHUB_TOKEN` in its environment: GitHub's API allows few anonymous calls from CI
+machines (plugin-check falls back to the release pages if it's refused).
+
+## Windows plugins on a Mac or Linux (Wine)
+
+You can run the Windows validators under [Wine](https://www.winehq.org) to look at a
+Windows build without a PC, but treat it as a rough check: Wine isn't Windows, so a
+pass is encouraging and a failure may be Wine's. OpenGL windows, audio timing and
+drivers (rtpMIDI, ASIO) are where it differs most. For a real answer, run
+plugin-check on a Windows CI runner (see above).
+
+```sh
+# macOS (Apple Silicon runs it through Rosetta 2): brew install --cask --no-quarantine wine-stable
+wine pluginval.exe --skip-gui-tests --strictness-level 5 --validate MySynth.vst3
+wine clap-validator.exe validate MySynth.clap
+```
 
 ## Licence
 
