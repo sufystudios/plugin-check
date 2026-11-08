@@ -31,10 +31,11 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 PASS, WARN, FAIL, SKIP = "passed", "warning", "failed", "skipped"
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
@@ -74,10 +75,26 @@ def log(message, verbose):
 
 
 def download(url, verbose):
+    """Python's own HTTPS, or curl when Python has no certificates to check with (the
+    python.org installer on macOS, until its Install Certificates step is run)."""
     log(f"downloading {url}", verbose)
     request = urllib.request.Request(url, headers={"User-Agent": f"plugin-check/{VERSION}"})
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return response.read()
+    except urllib.error.URLError as e:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(e):
+            raise
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("Python can't verify HTTPS certificates here and curl isn't installed. "
+                           "On macOS, run 'Install Certificates.command' in your Python folder.")
+    log("Python has no CA certificates; downloading with curl", verbose)
+    p = subprocess.run([curl, "-fsSL", "-A", f"plugin-check/{VERSION}", url], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=300)
+    if p.returncode != 0:
+        raise RuntimeError(f"curl couldn't download {url}: {p.stderr.decode(errors='replace').strip()}")
+    return p.stdout
 
 
 def latest_assets(repo, verbose):
@@ -138,6 +155,7 @@ class Tools:
     def pluginval(self):
         if "pluginval" in self._found:
             return self._found["pluginval"]
+        self._found["pluginval"] = None  # if fetching it fails, don't try again for the next plugin
         exe = "pluginval.exe" if SYSTEM == "Windows" else "pluginval"
         path = shutil.which("pluginval")
         if not path:
@@ -154,6 +172,7 @@ class Tools:
     def clap_validator(self):
         if "clap-validator" in self._found:
             return self._found["clap-validator"]
+        self._found["clap-validator"] = None
         exe = "clap-validator.exe" if SYSTEM == "Windows" else "clap-validator"
         path = shutil.which("clap-validator")
         if not path:
@@ -428,19 +447,29 @@ def plugin_paths(paths):
     return found
 
 
+def guarded(id, title, step):
+    """Runs one step; a problem in it (a failed download, say) is reported as that
+    step's failure rather than hiding the others."""
+    try:
+        result = step()
+        return result if isinstance(result, list) else [result]
+    except Exception as e:
+        return [Check(id, title, FAIL, f"{type(e).__name__}: {e}",
+                      "Rerun with --verbose to see what plugin-check was doing.")]
+
+
 def check_plugin(path, fmt, tools, args):
     checks = []
     if "bundle" in args.only:
-        bundle, _ = bundle_checks(path, fmt, args.verbose)
-        checks += bundle
+        checks += guarded("bundle", "Bundle checks", lambda: bundle_checks(path, fmt, args.verbose)[0])
     if fmt in ("VST3", "AU") and "pluginval" in args.only:
-        checks.append(check_pluginval(path, fmt, tools, args))
+        checks += guarded("pluginval", f"pluginval ({fmt})", lambda: check_pluginval(path, fmt, tools, args))
     if fmt == "CLAP" and "clap-validator" in args.only:
-        checks.append(check_clap_validator(path, tools, args))
+        checks += guarded("clap-validator", "clap-validator (CLAP)", lambda: check_clap_validator(path, tools, args))
     if fmt == "AU" and "auval" in args.only:
-        checks += check_auval(path, args)
+        checks += guarded("auval", "auval (AU)", lambda: check_auval(path, args))
     if fmt == "AU" and "auv3-test" in args.only:
-        checks += check_auv3_test(path, args)
+        checks += guarded("auv3-test", "auv3-test", lambda: check_auv3_test(path, args))
     return checks
 
 
