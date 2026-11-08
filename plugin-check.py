@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 PASS, WARN, FAIL, SKIP = "passed", "warning", "failed", "skipped"
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
@@ -316,9 +316,15 @@ def check_pluginval(path, fmt, tools, args):
                      f"Timed out after {args.timeout} s.\n" + tail(out),
                      "A hang usually means a deadlock in the plugin's UI or state code.")
     failures = [l.strip() for l in out.splitlines() if "!!! FAILED" in l or "*** FAILED" in l or "FAILED:" in l]
-    if code == 0:
+    # JUCE's test runner logs "Starting test: pluginval / <name>..." for each test it runs.
+    started = len(re.findall(r"Starting tests?(?: in)?:", out))
+    if code == 0 and started:
         return Check("pluginval", f"pluginval ({fmt}), strictness {args.strictness}", PASS,
-                     f"All tests passed in {seconds:.0f} s.")
+                     f"{started} tests passed in {seconds:.0f} s.")
+    if code == 0:
+        return Check("pluginval", f"pluginval ({fmt}), strictness {args.strictness}", WARN,
+                     "pluginval exited cleanly but ran no tests that plugin-check could see.\n" + tail(out),
+                     "Rerun with --verbose and check it found the plugin.")
     return Check("pluginval", f"pluginval ({fmt}), strictness {args.strictness}", FAIL,
                  ("\n".join(failures[:12]) if failures else tail(out)),
                  "Rerun with --verbose for pluginval's full log.")
@@ -331,43 +337,38 @@ def check_clap_validator(path, tools, args):
     code, out, seconds = run([exe, "validate", "--json", path], args.timeout, args.verbose)
     if code is None:
         return Check("clap-validator", "clap-validator (CLAP)", FAIL, f"Timed out after {args.timeout} s.\n" + tail(out))
-    failed, warned, total = [], [], 0
+    failed, warned, skipped, total = [], [], 0, 0
     try:
-        start = out.index("{")
-        report = json.loads(out[start:])
-        groups = []
-        for key, value in report.items():
-            if isinstance(value, dict) and key.endswith("tests"):
-                for sub in value.values():
-                    groups.append(sub if isinstance(sub, list) else [sub])
-            elif isinstance(value, list) and key.endswith("tests"):
-                groups.append(value)
-        for group in groups:
-            for test in group:
-                if not isinstance(test, dict):
-                    continue
-                total += 1
-                status = test.get("status", {})
-                code_name = status.get("code", "") if isinstance(status, dict) else str(status)
-                name = test.get("name", "?")
-                reason = status.get("details", "") if isinstance(status, dict) else ""
-                if code_name in ("failed", "crashed"):
-                    failed.append(f"{name}: {reason}".strip(": "))
-                elif code_name == "warning":
-                    warned.append(f"{name}: {reason}".strip(": "))
+        # {"results": [{"test": {"plugin-instance": {"test": "name", ...}}, "status": {"code": "success", ...}}]}
+        report = json.loads(out[out.index("{"):] if out.lstrip().startswith("{") else out[out.index("\n{") + 1:])
+        for result in report.get("results", []):
+            total += 1
+            test = result.get("test", {})
+            inner = next(iter(test.values()), {}) if isinstance(test, dict) and test else {}
+            name = inner.get("test", "?") if isinstance(inner, dict) else str(test)
+            status = result.get("status", {})
+            code_name = status.get("code", "") if isinstance(status, dict) else str(status)
+            reason = (status.get("details") or "") if isinstance(status, dict) else ""
+            line = f"{name}: {reason}".strip(": ")
+            if code_name in ("failed", "crashed"):
+                failed.append(line)
+            elif code_name == "warning":
+                warned.append(line)
+            elif code_name == "skipped":
+                skipped += 1
     except (ValueError, AttributeError):
-        # Older versions print text only: "N tests run, N passed, N failed, ..."
-        m = re.search(r"(\d+) tests? run, (\d+) passed, (\d+) failed", out)
-        if m:
-            total = int(m.group(1))
-            failed = [l.strip() for l in out.splitlines() if "FAILED" in l.upper()][: int(m.group(3))] or (
-                ["(see --verbose)"] if int(m.group(3)) else [])
+        pass
+    if not total and not failed:
+        return Check("clap-validator", "clap-validator (CLAP)", FAIL if code not in (0, None) else WARN,
+                     "Couldn't read clap-validator's results.\n" + tail(out),
+                     "Run it yourself with --verbose; its output format may have changed.")
     if failed or (code not in (0, None) and not total):
         return Check("clap-validator", "clap-validator (CLAP)", FAIL,
                      "\n".join(failed[:12]) if failed else tail(out),
                      "Rerun clap-validator with --only-failed for the full reasons.")
     status = WARN if warned else PASS
-    detail = f"{total} tests, none failed, in {seconds:.0f} s." + ("\n" + "\n".join(warned[:8]) if warned else "")
+    detail = (f"{total} tests ({total - skipped - len(warned)} passed, {skipped} skipped), none failed, in {seconds:.0f} s."
+              + ("\n" + "\n".join(warned[:8]) if warned else ""))
     return Check("clap-validator", "clap-validator (CLAP)", status, detail)
 
 
